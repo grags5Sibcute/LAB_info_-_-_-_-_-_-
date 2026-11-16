@@ -1,189 +1,190 @@
-#include <ctype.h>
-#include <errno.h>
-#include <limits.h>
 #include <stdio.h>
-#include <stdlib.h>
 
 #define MEMORY_SIZE 256
 #define START_PC 6
+// Диапазон int в используемой 32-битной модели целых чисел.
+#define MAX_INT 2147483647LL
+#define MIN_INT (-2147483647LL - 1)
 
-#define PC 0
-#define ACC 1
-#define IR 2
-#define VECTOR 3
-#define HALTED 4
-#define ERROR 5
-
-struct Machine
+// Пробелы, табуляция и переносы строк разделяют числа в файле.
+static int is_space(int ch)
 {
-    int cpu_state[8];
-    int memory[256];
-    int loaded_cells;
-    int in_handler;
-};
+    return ch == ' ' || ch == '\t' || ch == '\n' ||
+           ch == '\r' || ch == '\v' || ch == '\f';
+}
 
-/* One memory array holds instructions, addresses and data.
-   PC selects the next instruction; ACC stores the arithmetic result. */
-static int load_program(struct Machine *vm)
+/* Результат: 1 — число прочитано, 0 — конец файла, -1 — ошибка. */
+static int read_number(FILE *file, int *number)
 {
-    FILE *file = fopen("program.txt", "r");
-    if (file == NULL)
-    {
-        puts("Cannot open program.txt");
+    int ch = fgetc(file);
+    while (is_space(ch))
+        ch = fgetc(file);
+
+    if (ch == EOF)
         return 0;
+
+    int negative = ch == '-';
+    if (ch == '-' || ch == '+')
+        ch = fgetc(file);
+
+    if (ch < '0' || ch > '9')
+        return -1;
+
+    // Например, из цифр 1 и 2 получаем 1 * 10 + 2 = 12.
+    long long value = 0;
+    long long limit = MAX_INT;
+    if (negative)
+        limit = -MIN_INT;
+    while (ch >= '0' && ch <= '9')
+    {
+        value = value * 10 + (ch - '0');
+        if (value > limit)
+            return -1;
+        ch = fgetc(file);
     }
 
-    char token[64];
-    while (fscanf(file, "%63s", token) == 1)
-    {
-        int separator = fgetc(file);
-        char *end;
-        errno = 0;
-        long number = strtol(token, &end, 10);
+    // После числа разрешён разделитель или конец файла.
+    if (ch != EOF && !is_space(ch))
+        return -1;
 
-        if (vm->loaded_cells == MEMORY_SIZE ||
-            (separator != EOF && !isspace(separator)) ||
-            end == token || *end != '\0' || errno == ERANGE ||
-            number < INT_MIN || number > INT_MAX)
-        {
-            printf("Invalid input at memory cell %d\n", vm->loaded_cells);
+    if (negative)
+        value = -value;
+    *number = (int)value;
+    return 1;
+}
+
+// Команды и данные лежат в одном массиве memory — принцип фон Неймана.
+// Структура объединяет эту память и регистры виртуальной машины.
+struct Machine {
+    int memory[MEMORY_SIZE];
+    // 0 — PC, 1 — ACC, 2 — IR, 3 — вектор, 4 — стоп, 5 — ошибка.
+    // Ячейки 6 и 7 оставляем в резерве.
+    int cpu_state[8];
+};
+
+int main(void)
+{
+    struct Machine machine = {0};
+    // Указатели дают короткие имена массивам внутри структуры.
+    int *memory = machine.memory;
+    int *cpu_state = machine.cpu_state;
+    int in_handler = 0;
+
+    FILE *file = fopen("program.txt", "r");
+    if (file == NULL) {
+        puts("Cannot open program.txt");
+        return 1;
+    }
+
+    int count = 0;
+    int number;
+    int read;
+    while ((read = read_number(file, &number)) == 1) {
+        if (count == MEMORY_SIZE) {
+            printf("Invalid input at memory cell %d\n", count);
             fclose(file);
-            return 0;
+            return 1;
         }
-
-        vm->memory[vm->loaded_cells] = (int)number;
-        vm->loaded_cells++;
+        memory[count] = number;
+        count++;
     }
 
     int read_failed = ferror(file);
     fclose(file);
-    if (read_failed || vm->loaded_cells <= START_PC)
-    {
-        puts("Cannot read a complete program starting at address 6");
-        return 0;
-    }
-    return 1;
-}
-
-static int valid_address(int address)
-{
-    return address >= 0 && address < MEMORY_SIZE;
-}
-static void interrupt_machine(struct Machine *vm, int error, const char *reason)
-{
-    int *cpu = vm->cpu_state;
-    cpu[ERROR] = error;
-    printf("acc=%d, ERROR %d: %s\n", cpu[ACC], error, reason);
-
-    if (vm->in_handler)
-    {
-        puts("Repeated interrupt: execution stopped");
-        cpu[HALTED] = 1;
-    }
-    else if (!valid_address(cpu[VECTOR]))
-    {
-        printf("Invalid interrupt vector: %d\n", cpu[VECTOR]);
-        cpu[HALTED] = 1;
-    }
-    else
-    {
-        vm->in_handler = 1;
-        cpu[PC] = cpu[VECTOR];
-        printf("Interrupt: pc <- %d\n", cpu[PC]);
-    }
-}
-static void execute(struct Machine *vm)
-{
-    int *cpu = vm->cpu_state;
-    int *memory = vm->memory;
-
-    while (!cpu[HALTED])
-    {
-        int pc = cpu[PC];
-        if (!valid_address(pc))
-        {
-            printf("pc=%d: ", pc);
-            interrupt_machine(vm, 1, "instruction address out of range");
-            continue;
-        }
-        cpu[IR] = memory[pc];
-        int opcode = cpu[IR];
-        printf("pc=%d: opcode=%d, ", pc, opcode);
-
-        if (opcode == 0)
-        {
-            cpu[HALTED] = 1;
-            printf("operand=-, acc=%d (HALT)\n", cpu[ACC]);
-            continue;
-        }
-        if (opcode < 1 || opcode > 5)
-        {
-            puts("operand=-");
-            interrupt_machine(vm, 2, "unknown opcode");
-            continue;
-        }
-        if (!valid_address(pc + 1) || pc + 1 >= vm->loaded_cells)
-        {
-            puts("operand=-");
-            interrupt_machine(vm, 3, "missing operand cell");
-            continue;
-        }
-        int operand = memory[pc + 1];
-        int next_pc = pc + 2;
-        printf("operand=%d, ", operand);
-
-        if (opcode == 5 && cpu[ACC] != 0)
-        {
-            printf("acc=%d (JZ not taken), next pc=%d\n", cpu[ACC], next_pc);
-            cpu[PC] = next_pc;
-            continue;
-        }
-        if (!valid_address(operand))
-        {
-            interrupt_machine(vm, 4, "operand address out of range");
-            continue;
-        }
-
-        long long result = cpu[ACC];
-        switch (opcode)
-        {
-            case 1:
-                result = memory[operand];
-                break;
-            case 2:
-                result += memory[operand];
-                break;
-            case 3:
-                result -= memory[operand];
-                break;
-            case 4:
-            case 5:
-                next_pc = operand;
-                break;
-        }
-
-        if (result < INT_MIN || result > INT_MAX)
-        {
-            interrupt_machine(vm, 5, "accumulator overflow");
-            continue;
-        }
-        cpu[ACC] = (int)result;
-        cpu[PC] = next_pc;
-        printf("acc=%d, next pc=%d\n", cpu[ACC], cpu[PC]);
-    }
-}
-int main(void)
-{
-    struct Machine vm = {0};
-    if (!load_program(&vm))
-    {
+    if (read == -1 || read_failed || count <= START_PC) {
+        puts("Invalid or incomplete program.txt");
         return 1;
     }
 
-    vm.cpu_state[PC] = START_PC;
-    vm.cpu_state[VECTOR] = vm.memory[0];
-    execute(&vm);
+    cpu_state[0] = START_PC;
+    cpu_state[3] = memory[0];
 
-    printf("Final: acc=%d, error=%d\n", vm.cpu_state[ACC], vm.cpu_state[ERROR]);
-    return vm.cpu_state[ERROR] != 0;
+    while (cpu_state[4] == 0) {
+        int pc = cpu_state[0];
+        int cmd = -1;
+        int addr = 0;
+        int error = 0;
+
+        // Проверяем адрес и только затем читаем ячейку.
+        if (pc < 0 || pc >= MEMORY_SIZE) {
+            error = 1;
+        } else {
+            cmd = memory[pc];
+            cpu_state[2] = cmd;
+            if (cmd < 0 || cmd > 5) {
+                error = 2;
+            } else if (cmd != 0) {
+                if (pc + 1 >= count) {
+                    error = 3;
+                } else {
+                    addr = memory[pc + 1];
+                    // При ACC != 0 команда 5 пропускает переход.
+                    if ((cmd != 5 || cpu_state[1] == 0) &&
+                        (addr < 0 || addr >= MEMORY_SIZE))
+                        error = 4;
+                }
+            }
+        }
+
+        if (error == 0) {
+            // Считаем в long long, чтобы проверить результат до записи в int.
+            long long acc = cpu_state[1];
+            int next_pc = pc + 2;
+
+            switch (cmd) {
+            case 0: // HALT: остановиться.
+                cpu_state[4] = 1;
+                break;
+            case 1: // LOAD: взять значение по адресу.
+                acc = memory[addr];
+                break;
+            case 2: // ADD: прибавить значение.
+                acc += memory[addr];
+                break;
+            case 3: // SUB: вычесть значение.
+                acc -= memory[addr];
+                break;
+            case 4: // JUMP: перейти всегда.
+                next_pc = addr;
+                break;
+            case 5: // JZ: перейти только при нулевом ACC.
+                if (acc == 0)
+                    next_pc = addr;
+                break;
+            }
+
+            if (acc < MIN_INT || acc > MAX_INT) {
+                error = 5;
+            } else {
+                cpu_state[1] = (int)acc;
+                if (cmd == 0) {
+                    printf("pc=%d: HALT, acc=%d\n", pc, cpu_state[1]);
+                } else {
+                    cpu_state[0] = next_pc;
+                    printf("pc=%d: cmd=%d, addr=%d, acc=%d, next pc=%d\n",
+                           pc, cmd, addr, cpu_state[1], next_pc);
+                }
+            }
+        }
+
+        // Обрабатываем любую ошибку здесь. Второй сбой завершает работу.
+        if (error != 0) {
+            cpu_state[5] = error;
+            printf("pc=%d: error=%d\n", pc, error);
+            if (in_handler) {
+                puts("Repeated interrupt: execution stopped");
+                cpu_state[4] = 1;
+            } else if (cpu_state[3] < 0 || cpu_state[3] >= MEMORY_SIZE) {
+                printf("Invalid interrupt vector: %d\n", cpu_state[3]);
+                cpu_state[4] = 1;
+            } else {
+                in_handler = 1;
+                cpu_state[0] = cpu_state[3];
+                printf("Interrupt: pc <- %d\n", cpu_state[0]);
+            }
+        }
+    }
+
+    printf("Final: acc=%d, error=%d\n", cpu_state[1], cpu_state[5]);
+    return cpu_state[5] != 0;
 }
